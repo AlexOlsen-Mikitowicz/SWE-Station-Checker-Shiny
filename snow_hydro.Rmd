@@ -1,0 +1,188 @@
+---
+title: "Hydrologic Analysis"
+author: "Alex Olsen-Mikitowicz"
+date: "1/14/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+
+library(RNRCS)
+library(metScanR)
+library(tidyverse)
+library(lubridate)
+library(dataRetrieval)
+library(riem)
+library(sf)
+library(mapview)
+library(MazamaSpatialUtils)
+
+
+
+
+
+```
+
+
+```{r usgs gauge downloader}
+states = c('CO','NM', 'AZ', 'OR', 'SD', 'MT', 'WA', 'ID', 'AK', 'CA', 'NV', 'UT', 'WY')
+
+#downloads usgs gage data for all snotel states only if a gage has min end date of at least 2019-10-01 and it has ten years of daily data
+
+state_downloader = function(state,
+                            min_end = ymd('2019-10-01'),
+                            min_count = 10*365) {
+ 
+ 
+  state_data = whatNWISdata(stateCd = state) %>%
+    filter(end_date > min_end,
+           count_nu > min_count) %>%
+    mutate(state = state)
+ 
+  print(state)
+  return(state_data)
+}
+
+
+all_western_gauges <- map_dfr(states,state_downloader)
+
+clean_western_gauges <- all_western_gauges %>%
+  filter(!is.na(dec_lat_va)) %>%
+  filter(!is.na(dec_long_va)) %>%
+  rename(lat = dec_lat_va, lon = dec_long_va)
+
+
+```
+
+
+
+```{r snotel downloader}
+
+all_snotel <- read.csv("raw\\snotel.csv") %>%
+  mutate(site_no = str_split_fixed(site_name, "\\(|\\)",3)[,2]) %>% 
+  mutate(id = site_no) %>%
+  as_tibble()
+
+```
+
+
+
+```{r asos downloader}
+
+
+asos_stations = c('AK_ASOS','AZ_ASOS', 'CA_ASOS', 'CO_ASOS', 'ID_ASOS', 'NM_ASOS', 'MT_ASOS', 'OR_ASOS', 'SD_ASOS', 'WA_ASOS', 'NV_ASOS', 'UT_ASOS', 'WY_ASOS')
+
+state_asos_downloader = function(state) {
+ 
+  state_asos = riem_stations(network = state) %>%
+    mutate(state = substr(state, start = 1, stop = 2))
+ 
+  print(state)
+  return(state_asos)
+}
+
+
+western_asos_stations <- map_dfr(asos_stations, state_asos_downloader) 
+
+western_asos_stations
+```
+
+
+```{r spatial setup}
+
+snotel_spatial <- st_as_sf(all_snotel, coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(.,crs = 2163)
+
+asos_spatial <- st_as_sf(western_asos_stations, coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(crs = 2163)
+
+stream_spatial <- st_as_sf(clean_western_gauges, coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(crs = 2163)
+
+#buffer snotel sites by 30km
+snotel_buffer <- st_buffer(snotel_spatial, dist = 30000)
+
+# find asos points within snotel polygons by subsetting
+asos_in_snotel <- asos_spatial[snotel_buffer,]
+
+ mapview(asos_in_snotel)
+```
+
+```{r downloading huc data}
+
+
+# library(httr)
+# get_mutate_HUC8s <- function(wfs = "http://cida.usgs.gov/gdp/geoserver/wfs",
+#                             feature = "derivative:wbdhu8_alb_simp",
+#                             plot_CRS = "+init=epsg:2163"){
+#  destination <- tempfile(pattern = 'huc_shape', fileext='.zip')
+#  query <- sprintf('%s?service=WFS&request=GetFeature&typeName=%s&outputFor#mat=shape-zip&version=1.0.0', wfs, feature)
+#  file <- GET(query, write_disk(destination, overwrite=T), progress())
+#  shp.path <- tempdir()
+#  unzip(destination, exdir = shp.path)
+#  layer <- strsplit(feature,'[:]')[[1]][2]
+#  hucs <- st_read(shp.path) %>%
+#    st_transform(.,2163)
+#  unlink(destination)
+#  return(hucs)
+# }
+# 
+# 
+# hucs <- get_mutate_HUC8s() %>% st_as_sf(.) %>%
+#   st_transform(.,2163)
+
+```
+
+```{r stiching state huc8}
+#list folers in huc8
+
+huc_list <- list.files("huc8", full.names = T)
+
+
+huc_shp_reader <- function(huc) {
+  
+  
+  shp_file <- paste0(huc,'/WBDHU8.shp') 
+  huc_st_shp <- st_read(shp_file) 
+  
+}
+
+snotel_state_hucs <- map(huc_list, huc_shp_reader)
+
+grouped_state_hucs <- do.call('rbind',snotel_state_hucs) %>%
+  st_transform(crs = 2163) %>%
+  st_simplify(dTolerance = 1000)
+
+
+mapview(grouped_state_hucs)
+
+```
+
+```{r subset hucs to snotel}
+
+snotel_in_hucs <- grouped_state_hucs[snotel_spatial,]
+
+
+```
+
+
+```{r overlay/join hucs in snotel with asos near snotel}
+
+mapview(snotel_in_hucs)
+mapview(asos_in_snotel)
+
+snotel_spatial <- st_transform(snotel_spatial, crs = 4326)
+asos_in_snotel <- st_transform(asos_in_snotel, crs = 4326)
+snotel_in_hucs <- st_transform(snotel_in_hucs, crs = 4326)
+
+save(snotel_in_hucs,asos_in_snotel,snotel_spatial,file='SnotelAnalysis.RData')
+
+
+
+load('SnotelAnalysis.RData')
+
+```
+
